@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping
 
 from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
+
+logger = logging.getLogger(__name__)
+LOOP_GUARD_TRIGGERED = "LOOP_GUARD_TRIGGERED"
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
@@ -24,6 +29,7 @@ IDEMPOTENT_TOOL_NAMES = frozenset(
         "web_search",
         "web_extract",
         "session_search",
+        "skill_view",
         "browser_snapshot",
         "browser_console",
         "browser_get_images",
@@ -77,6 +83,9 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
+    identical_success_warn_after: int = 2
+    identical_success_block_after: int = 3
+    max_tool_result_chars: int = 8000
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: "LoopCapConfig" = field(default_factory=lambda: LoopCapConfig())
@@ -121,6 +130,17 @@ class ToolCallGuardrailConfig:
             no_progress_block_after=_positive_int(
                 hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
                 defaults.no_progress_block_after,
+            ),
+            identical_success_warn_after=_positive_int(
+                warn_after.get("identical_success", data.get("identical_success_warn_after")),
+                defaults.identical_success_warn_after,
+            ),
+            identical_success_block_after=_positive_int(
+                hard_stop_after.get("identical_success", data.get("identical_success_block_after")),
+                defaults.identical_success_block_after,
+            ),
+            max_tool_result_chars=_non_negative_int(
+                data.get("max_tool_result_chars"), defaults.max_tool_result_chars
             ),
             loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
         )
@@ -281,12 +301,25 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._identical_success_counts: dict[ToolCallSignature, int] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
         # Per-turn runaway-loop cap counters. Reset every turn (this method
         # runs at the start of each run_conversation), so the caps bound a
         # single agent loop rather than accumulating across the session.
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+
+    def _trigger(self, decision: ToolGuardrailDecision) -> ToolGuardrailDecision:
+        if decision.should_halt:
+            logger.warning(
+                "%s code=%s tool=%s count=%s",
+                LOOP_GUARD_TRIGGERED,
+                decision.code,
+                decision.tool_name,
+                decision.count,
+            )
+            self._halt_decision = decision
+        return decision
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -308,6 +341,23 @@ class ToolCallGuardrailController:
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
+        identical_count = self._identical_success_counts.get(signature, 0)
+        if identical_count >= self.config.identical_success_block_after:
+            return self._trigger(
+                ToolGuardrailDecision(
+                    action="halt",
+                    code="repeated_identical_success_halt",
+                    message=(
+                        f"Stopped {tool_name}: the same tool call with the same arguments "
+                        f"succeeded {identical_count} times this request. "
+                        "Stop repeating it unchanged; use the result already provided."
+                    ),
+                    tool_name=tool_name,
+                    count=identical_count,
+                    signature=signature,
+                )
+            )
+
         exact_count = self._exact_failure_counts.get(signature, 0)
         if exact_count >= self.config.exact_failure_block_after:
             decision = ToolGuardrailDecision(
@@ -322,8 +372,7 @@ class ToolCallGuardrailController:
                 count=exact_count,
                 signature=signature,
             )
-            self._halt_decision = decision
-            return decision
+            return self._trigger(decision)
 
         if self._is_idempotent(tool_name):
             record = self._no_progress.get(signature)
@@ -342,8 +391,7 @@ class ToolCallGuardrailController:
                         count=repeat_count,
                         signature=signature,
                     )
-                    self._halt_decision = decision
-                    return decision
+                    return self._trigger(decision)
 
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -380,8 +428,7 @@ class ToolCallGuardrailController:
                     count=same_count,
                     signature=signature,
                 )
-                self._halt_decision = decision
-                return decision
+                return self._trigger(decision)
 
             if self.config.warnings_enabled and exact_count >= self.config.exact_failure_warn_after:
                 return ToolGuardrailDecision(
@@ -412,9 +459,43 @@ class ToolCallGuardrailController:
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
 
+        identical_count = self._identical_success_counts.get(signature, 0) + 1
+        self._identical_success_counts[signature] = identical_count
+        if self.config.hard_stop_enabled and identical_count >= self.config.identical_success_block_after:
+            return self._trigger(
+                ToolGuardrailDecision(
+                    action="halt",
+                    code="repeated_identical_success_halt",
+                    message=(
+                        f"Stopped {tool_name}: the same tool call with the same arguments "
+                        f"succeeded {identical_count} times this request. "
+                        "Stop repeating it unchanged."
+                    ),
+                    tool_name=tool_name,
+                    count=identical_count,
+                    signature=signature,
+                )
+            )
+        if (
+            self.config.hard_stop_enabled
+            and self.config.warnings_enabled
+            and identical_count >= self.config.identical_success_warn_after
+        ):
+            return ToolGuardrailDecision(
+                action="warn",
+                code="repeated_identical_success_warning",
+                message=(
+                    f"{tool_name} succeeded {identical_count} times with identical arguments. "
+                    "Use the result already provided instead of repeating it."
+                ),
+                tool_name=tool_name,
+                count=identical_count,
+                signature=signature,
+            )
+
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)
-            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
+            return ToolGuardrailDecision(tool_name=tool_name, signature=signature, count=identical_count)
 
         result_hash = _result_hash(result)
         previous = self._no_progress.get(signature)
@@ -475,8 +556,7 @@ class ToolCallGuardrailController:
                     count=self._turn_web_search_count,
                     signature=signature,
                 )
-                self._halt_decision = decision
-                return decision
+                return self._trigger(decision)
             self._turn_web_search_count += 1
             return None
 
@@ -485,6 +565,11 @@ class ToolCallGuardrailController:
             if not cap:
                 return None
             spawn_count = _subagent_spawn_count(args)
+            if spawn_count == 0:
+                # Control action (list/steer/stop) — spawns nothing. Never
+                # block: once the spawn cap is hit, steering/stopping the
+                # existing children is exactly what should still work.
+                return None
             if self._turn_subagent_count >= cap:
                 decision = ToolGuardrailDecision(
                     action="block",
@@ -499,12 +584,42 @@ class ToolCallGuardrailController:
                     count=self._turn_subagent_count,
                     signature=signature,
                 )
-                self._halt_decision = decision
-                return decision
+                return self._trigger(decision)
             self._turn_subagent_count += spawn_count
             return None
 
         return None
+
+
+def cap_tool_result_for_history(
+    text: str,
+    *,
+    max_chars: int = 8000,
+    store_dir: str | Path | None = None,
+) -> str:
+    """Keep huge tool output out of conversation history.
+
+    Truncates to ``max_chars`` and, when a store dir is given, writes the full
+    payload locally referenced by sha256. ``max_chars <= 0`` disables the cap.
+    """
+    if not text or max_chars <= 0 or len(text) <= max_chars:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+    ref = f"sha256={digest} chars={len(text)}"
+    if store_dir:
+        try:
+            root = Path(store_dir)
+            root.mkdir(parents=True, exist_ok=True)
+            path = root / f"{digest[:16]}.txt"
+            if not path.exists():
+                path.write_text(text, encoding="utf-8", errors="replace")
+            ref = f"{ref} path={path}"
+        except OSError:
+            logger.warning("failed to persist truncated tool result %s", digest[:16], exc_info=True)
+    return (
+        text[:max_chars]
+        + f"\n\n[TOOL_RESULT_TRUNCATED {ref}. Full output omitted from model context.]"
+    )
 
 
 def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
@@ -616,8 +731,13 @@ def _subagent_spawn_count(args: Mapping[str, Any]) -> int:
     delegate_task runs in one of two modes: a batch (``tasks`` is a non-empty
     list, one child per item) or a single task (``goal``). Count the batch size
     when present, otherwise 1, so the session subagent cap reflects real spawns
-    rather than delegate_task invocations.
+    rather than delegate_task invocations. Control actions (list/steer/stop)
+    spawn nothing and must not consume the cap.
     """
+    if isinstance(args, Mapping):
+        action = str(args.get("action") or "").strip().lower()
+        if action in ("list", "steer", "stop"):
+            return 0
     tasks = args.get("tasks") if isinstance(args, Mapping) else None
     if isinstance(tasks, list) and tasks:
         return len(tasks)

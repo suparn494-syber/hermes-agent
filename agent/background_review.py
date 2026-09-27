@@ -940,6 +940,14 @@ def _run_review_in_thread(
             # Hardcoding ["memory", "skills"] granted the review LLM the MEMORY.md
             # read/write tool even when a profile set memory_enabled: false,
             # contaminating a memory-disabled profile (#54937 layer 2).
+            # Defense in depth: background review is analysis-only unless the
+            # owner explicitly scopes the task as skill maintenance. skill_manage
+            # also enforces this policy authoritatively at the mutation boundary.
+            try:
+                from tools.skill_write_policy import background_review_writes_allowed
+                _review_skill_writes = background_review_writes_allowed()
+            except Exception:
+                _review_skill_writes = False
             review_toolsets = ["skills"]
             if review_agent._memory_enabled or review_agent._user_profile_enabled:
                 review_toolsets.insert(0, "memory")
@@ -950,6 +958,8 @@ def _run_review_in_thread(
                     quiet_mode=True,
                 )
             }
+            if not _review_skill_writes:
+                review_whitelist.discard("skill_manage")
             set_thread_tool_whitelist(
                 review_whitelist,
                 deny_msg_fmt=(
@@ -972,9 +982,17 @@ def _run_review_in_thread(
                     _digest_history(messages_snapshot) if _routed
                     else messages_snapshot
                 )
+                _skill_scope_instruction = ""
+                if not _review_skill_writes:
+                    _skill_scope_instruction = (
+                        "\n\nThis is an analysis-only skill review. Do not create, "
+                        "update, patch, or delete skills. Inspect existing skills "
+                        "with read-only tools and report concise recommendations."
+                    )
                 review_agent.run_conversation(
                     user_message=(
                         prompt
+                        + _skill_scope_instruction
                         + "\n\nYou can only call memory and skill "
                         "management tools. Other tools will be denied "
                         "at runtime — do not attempt them."

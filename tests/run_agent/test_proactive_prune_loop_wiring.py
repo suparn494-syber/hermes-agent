@@ -135,6 +135,24 @@ def _run_tool_loop(agent, n_tool_iterations: int):
     return result
 
 
+def test_context_hard_ceiling_stops_before_provider(agent):
+    agent.compression_enabled = False
+    agent.context_hard_ceiling_tokens = 1
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("preserve this request")
+
+    agent.client.chat.completions.create.assert_not_called()
+    assert result["turn_exit_reason"] == "context_hard_ceiling"
+    assert result["failed"] is True
+    assert "LOOP_GUARD_TRIGGERED" in result["final_response"]
+    assert agent.iteration_budget.used == 0
+
+
 class TestProactivePruneLoopWiring:
     def test_full_compression_preempts_proactive_prune(self, agent):
         agent.context_compressor.should_compress.return_value = True

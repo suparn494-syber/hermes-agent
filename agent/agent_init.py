@@ -785,6 +785,7 @@ def init_agent(
     agent._executing_tools = False
     agent._tool_guardrails = ToolCallGuardrailController()
     agent._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
+    agent._circuit_broken = False
 
     # Interrupt mechanism for breaking out of tool loops
     agent._interrupt_requested = False
@@ -2043,6 +2044,16 @@ def init_agent(
                 compression_threshold_tokens = None
         except (TypeError, ValueError):
             compression_threshold_tokens = None
+    compression_hard_ceiling_tokens = _compression_cfg.get("hard_ceiling_tokens")
+    if compression_hard_ceiling_tokens is not None:
+        try:
+            compression_hard_ceiling_tokens = int(compression_hard_ceiling_tokens)
+            if compression_hard_ceiling_tokens <= 0:
+                compression_hard_ceiling_tokens = None
+        except (TypeError, ValueError):
+            compression_hard_ceiling_tokens = None
+    else:
+        compression_hard_ceiling_tokens = None
     # In-place compaction: when True, compress_context() rewrites the message
     # list + rebuilds the system prompt WITHOUT rotating the session id (no
     # parent_session_id chain, no `name #N` renumber). See #38763 and
@@ -2556,6 +2567,7 @@ def init_agent(
             pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
+    agent.context_hard_ceiling_tokens = compression_hard_ceiling_tokens or 0
     # Apply micro-compaction settings to the compressor (feature is opt-in)
     _cc = getattr(agent, "context_compressor", None)
     if _cc is not None and hasattr(_cc, "_micro_compact_enabled"):

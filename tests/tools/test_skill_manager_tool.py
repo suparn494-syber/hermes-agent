@@ -441,12 +441,13 @@ class TestSkillManageDispatcher:
             set_current_write_origin,
         )
 
+        from tools.skill_write_policy import SkillWritePolicy, skill_write_policy
         token = set_current_write_origin(BACKGROUND_REVIEW)
         try:
-            with _skill_dir(tmp_path), \
+            with _skill_dir(tmp_path), skill_write_policy(SkillWritePolicy.EXPLICIT_SKILL_MAINTENANCE), \
                  patch("tools.skill_usage.is_protected_builtin", return_value=False), \
                  patch("tools.skill_usage.is_hub_installed", return_value=False), \
-                 patch("tools.skill_usage.is_bundled",
+                 patch("tools.skill_usage.is_bundled", \
                        side_effect=lambda skill_name: skill_name == "bundled"):
                 skill_manage(action="create", name="umbrella", content=VALID_SKILL_CONTENT)
                 skill_manage(action="create", name="bundled", content=VALID_SKILL_CONTENT)
@@ -586,9 +587,11 @@ class TestExternalSkillMutations:
 
         with _skill_dir(tmp_path):
             _create_skill("my-skill", VALID_SKILL_CONTENT)
+            from tools.skill_write_policy import SkillWritePolicy, skill_write_policy
             token = set_current_write_origin(BACKGROUND_REVIEW)
             try:
-                with patch("tools.skill_usage.get_record", side_effect=_fake_get_record):
+                with skill_write_policy(SkillWritePolicy.EXPLICIT_SKILL_MAINTENANCE), \
+                     patch("tools.skill_usage.get_record", side_effect=_fake_get_record):
                     raw = skill_manage(
                         action="patch",
                         name="my-skill",
@@ -612,9 +615,10 @@ class TestExternalSkillMutations:
 
         with _skill_dir(tmp_path):
             _create_skill("manual-skill", VALID_SKILL_CONTENT)
+            from tools.skill_write_policy import SkillWritePolicy, skill_write_policy
             token = set_current_write_origin(BACKGROUND_REVIEW)
             try:
-                with patch(
+                with skill_write_policy(SkillWritePolicy.EXPLICIT_SKILL_MAINTENANCE), patch(
                     "tools.skill_usage.load_usage",
                     side_effect=ValueError("corrupt usage data"),
                 ):
@@ -653,12 +657,14 @@ class TestBackgroundOwnershipPolicyConsistency:
             set_current_write_origin,
         )
 
+        from tools.skill_write_policy import SkillWritePolicy, skill_write_policy
         token = set_current_write_origin(BACKGROUND_REVIEW)
         try:
-            mark_background_review_skill_read(tmp_path / name / "SKILL.md")
-            return json.loads(skill_manage(
-                action="patch", name=name, old_string=old, new_string=new,
-            ))
+            with skill_write_policy(SkillWritePolicy.EXPLICIT_SKILL_MAINTENANCE):
+                mark_background_review_skill_read(tmp_path / name / "SKILL.md")
+                return json.loads(skill_manage(
+                    action="patch", name=name, old_string=old, new_string=new,
+                ))
         finally:
             reset_current_write_origin(token)
 
@@ -860,11 +866,13 @@ def _curator_pass(tmp_path, *, monkeypatch):
     skills_root = hermes_home / "skills"
     skills_root.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    from tools.skill_write_policy import SkillWritePolicy, skill_write_policy
     with patch("tools.skill_manager_tool.SKILLS_DIR", skills_root), \
          patch("tools.skills_tool.SKILLS_DIR", skills_root), \
          patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_root]), \
          patch("tools.skill_usage._is_curator_managed_record", return_value=True), \
-         patch("tools.skill_provenance.is_background_review", return_value=True):
+         patch("tools.skill_provenance.is_background_review", return_value=True), \
+         skill_write_policy(SkillWritePolicy.EXPLICIT_SKILL_MAINTENANCE):
         yield skills_root
 
 

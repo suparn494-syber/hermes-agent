@@ -131,6 +131,69 @@ def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_succes
         assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
 
 
+def test_hard_stop_halts_repeated_identical_success_including_terminal():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            identical_success_warn_after=2,
+            identical_success_block_after=3,
+        )
+    )
+    args = {"command": "ls /d/hermes"}
+    actions = []
+    for _ in range(3):
+        assert controller.before_call("terminal", args).action == "allow"
+        actions.append(controller.after_call("terminal", args, "ok", failed=False).action)
+    assert actions[0] == "allow"
+    assert actions[1] == "warn"
+    assert actions[2] == "halt"
+    assert controller.halt_decision.code == "repeated_identical_success_halt"
+    blocked = controller.before_call("terminal", args)
+    assert blocked.should_halt is True
+
+
+def test_skill_view_is_idempotent_and_blocks_no_progress():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            identical_success_warn_after=2,
+            identical_success_block_after=3,
+        )
+    )
+    args = {"name": "hermes-agent", "file_path": ""}
+    dump = "x" * 100
+    assert controller._is_idempotent("skill_view")
+    assert controller.before_call("skill_view", args).action == "allow"
+    assert controller.after_call("skill_view", args, dump, failed=False).action == "allow"
+    assert controller.after_call("skill_view", args, dump, failed=False).action == "warn"
+    halt = controller.after_call("skill_view", args, dump, failed=False)
+    assert halt.action == "halt"
+    assert halt.code == "repeated_identical_success_halt"
+
+
+def test_cap_tool_result_for_history_truncates_and_stores_hash():
+    import tempfile
+    from pathlib import Path
+    from agent.tool_guardrails import cap_tool_result_for_history
+
+    huge = "<html>" + ("a" * 20000) + "(function(){window.ytplayer=1})"
+    tmp_path = Path(tempfile.mkdtemp())
+    out = cap_tool_result_for_history(huge, max_chars=8000, store_dir=tmp_path)
+    assert len(out) < len(huge)
+    assert "TOOL_RESULT_TRUNCATED" in out
+    assert "sha256=" in out
+    stored = list(tmp_path.glob("*.txt"))
+    assert len(stored) == 1
+    assert stored[0].read_text(encoding="utf-8") == huge
+
+
+def test_short_tool_result_unaffected():
+    from agent.tool_guardrails import cap_tool_result_for_history
+
+    short = '{"ok": true}'
+    assert cap_tool_result_for_history(short, max_chars=8000) == short
+
+
 
 
 
@@ -167,6 +230,25 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
+
+
+def test_subagent_cap_allows_control_actions_after_limit():
+    config = ToolCallGuardrailConfig(loop_caps=LoopCapConfig(max_subagents=1))
+    controller = ToolCallGuardrailController(config)
+
+    assert controller.before_call("delegate_task", {"goal": "first"}).action == "allow"
+    assert controller.before_call("delegate_task", {"goal": "second"}).action == "block"
+
+    controller = ToolCallGuardrailController(config)
+    assert controller.before_call("delegate_task", {"goal": "first"}).action == "allow"
+    assert (
+        controller.before_call(
+            "delegate_task", {"action": "stop", "subagent_id": "child-1"}
+        ).action
+        == "allow"
+    )
+    assert controller.before_call("delegate_task", {"action": "list"}).action == "allow"
+    assert controller.before_call("delegate_task", {"goal": "third"}).action == "block"
 
 
 

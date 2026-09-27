@@ -122,9 +122,10 @@ def test_background_review_installs_thread_local_whitelist():
 
     assert "whitelist" in captured, "set_thread_tool_whitelist was not called"
     whitelist = captured["whitelist"]
-    # memory + skills tools must be allowed
+    # Memory analysis remains allowed, but skill_manage is suppressed unless
+    # the task explicitly authorizes skill maintenance.
     assert "memory" in whitelist
-    assert "skill_manage" in whitelist
+    assert "skill_manage" not in whitelist
     assert "skill_view" in whitelist
     assert "skills_list" in whitelist
     # dangerous tools must NOT be in the whitelist
@@ -133,6 +134,90 @@ def test_background_review_installs_thread_local_whitelist():
     assert "delegate_task" not in whitelist
     assert "web_search" not in whitelist
     assert "execute_code" not in whitelist
+
+
+def test_background_review_explicit_owner_scope_reaches_thread_whitelist():
+    """Trusted explicit maintenance must survive the background thread boundary."""
+    import run_agent
+    from hermes_cli import plugins as _plugins
+    from tools.skill_write_policy import SkillWritePolicy, skill_write_policy
+
+    captured = {}
+
+    def _capture_whitelist(whitelist, deny_msg_fmt=None):
+        captured["whitelist"] = set(whitelist)
+        raise RuntimeError("stop after capturing whitelist")
+
+    agent = _make_agent_stub(run_agent.AIAgent)
+    with skill_write_policy(SkillWritePolicy.EXPLICIT_SKILL_MAINTENANCE), \
+         patch.object(run_agent.AIAgent, "__init__", lambda self, *args, **kwargs: None), \
+         patch.object(_plugins, "set_thread_tool_whitelist", _capture_whitelist), \
+         patch("threading.Thread", _SyncThread):
+        agent._spawn_background_review(
+            messages_snapshot=[],
+            review_memory=False,
+            review_skills=True,
+        )
+
+    assert "skill_manage" in captured["whitelist"]
+    assert "terminal" not in captured["whitelist"]
+
+
+def test_background_review_explicit_owner_scope_reaches_real_thread_whitelist():
+    """Explicit maintenance policy must propagate through an actual OS thread."""
+    import threading
+    import run_agent
+    from hermes_cli import plugins as _plugins
+    from tools.skill_write_policy import SkillWritePolicy, skill_write_policy
+
+    captured = {}
+    done = threading.Event()
+
+    def _capture_whitelist(whitelist, deny_msg_fmt=None):
+        captured["whitelist"] = set(whitelist)
+        done.set()
+        raise RuntimeError("stop after capturing whitelist")
+
+    agent = _make_agent_stub(run_agent.AIAgent)
+    with skill_write_policy(SkillWritePolicy.EXPLICIT_SKILL_MAINTENANCE), \
+         patch.object(run_agent.AIAgent, "__init__", lambda self, *args, **kwargs: None), \
+         patch.object(_plugins, "set_thread_tool_whitelist", _capture_whitelist):
+        agent._spawn_background_review(
+            messages_snapshot=[],
+            review_memory=False,
+            review_skills=True,
+        )
+        assert done.wait(timeout=2), "background review thread did not reach whitelist setup"
+
+    assert "skill_manage" in captured["whitelist"]
+    assert "terminal" not in captured["whitelist"]
+
+
+def test_background_review_read_only_prompt_does_not_request_skill_mutation():
+    """Default-deny reviews should spend their turn analysing, not attempting writes."""
+    import run_agent
+
+    captured = {}
+
+    def _capture_run(self, *args, **kwargs):
+        captured["user_message"] = kwargs.get("user_message", "")
+        return {"final_response": "ok"}
+
+    agent = _make_agent_stub(run_agent.AIAgent)
+    with patch.object(run_agent.AIAgent, "__init__", lambda self, *args, **kwargs: None), \
+         patch.object(run_agent.AIAgent, "run_conversation", _capture_run), \
+         patch.object(run_agent.AIAgent, "shutdown_memory_provider", lambda self: None), \
+         patch.object(run_agent.AIAgent, "close", lambda self: None), \
+         patch("threading.Thread", _SyncThread):
+        agent._spawn_background_review(
+            messages_snapshot=[],
+            review_memory=False,
+            review_skills=True,
+        )
+
+    prompt = captured["user_message"].lower()
+    assert "analysis-only" in prompt
+    assert "do not create, update, patch, or delete skills" in prompt
 
 
 

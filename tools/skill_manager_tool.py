@@ -1558,6 +1558,31 @@ def skill_manage(
 
     Returns JSON string with results.
     """
+    # Authoritative task-scoped deny: read-only/audit/safety tasks may still
+    # run analysis and self-improvement review, but no skill mutation reaches
+    # the filesystem. Explicit skill-maintenance tasks use the normal guards.
+    try:
+        from tools.skill_provenance import is_background_review
+        from tools.skill_write_policy import (
+            background_review_writes_allowed,
+            read_only_task_active,
+            skill_write_block_reason,
+        )
+        if read_only_task_active() or (is_background_review() and not background_review_writes_allowed()):
+            reason = skill_write_block_reason() or "the background review has no explicit owner authorization"
+            return json.dumps({
+                "success": False,
+                "error": f"Skill writes are blocked by {reason}; explicit owner authorization for skill maintenance is required.",
+                "_read_only_policy": True,
+            }, ensure_ascii=False)
+    except Exception:
+        # Fail closed if the policy module or provenance cannot be evaluated.
+        return json.dumps({
+            "success": False,
+            "error": "Skill write policy could not be evaluated; refusing mutation (fail-closed).",
+            "_read_only_policy": True,
+        }, ensure_ascii=False)
+
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)

@@ -93,6 +93,7 @@ from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
+from tools.skill_write_policy import scoped_skill_write_policy
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
@@ -1419,6 +1420,7 @@ def _notify_context_engine_turn_complete(
         )
 
 
+@scoped_skill_write_policy
 def run_conversation(
     agent,
     user_message: Any,
@@ -1431,6 +1433,8 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    *,
+    skill_write_policy=None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1456,6 +1460,9 @@ def run_conversation(
         persist_user_display_metadata: Optional payload for that event
             (e.g. a delegation's task count).
                 or queuing follow-up prefetch work.
+        skill_write_policy: Trusted caller-selected task scope. Use
+            ``read_only`` to deny skill mutations or
+            ``explicit_skill_maintenance`` for owner-authorized maintenance.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -2388,6 +2395,33 @@ def run_conversation(
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
         
+        _hard_ceiling = int(getattr(agent, "context_hard_ceiling_tokens", 0) or 0)
+        if _hard_ceiling and request_pressure_tokens > _hard_ceiling:
+            logger.warning(
+                "LOOP_GUARD_TRIGGERED context_ceiling tokens=%s cap=%s session=%s",
+                request_pressure_tokens,
+                _hard_ceiling,
+                getattr(agent, "session_id", ""),
+            )
+            final_response = (
+                "LOOP_GUARD_TRIGGERED. Conversation context exceeded the safety "
+                f"ceiling ({request_pressure_tokens} > {_hard_ceiling} tokens). "
+                "The current user request and system/safety instructions were not discarded. "
+                "Send a follow-up to continue after compaction."
+            )
+            failed = True
+            _turn_exit_reason = "context_hard_ceiling"
+            messages.append({"role": "assistant", "content": final_response})
+            agent._emit_status("⚠️ LOOP_GUARD_TRIGGERED: context ceiling")
+            agent._circuit_broken = True
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            try:
+                agent.iteration_budget.refund()
+            except Exception:
+                pass
+            break
+
         if not agent.quiet_mode:
             agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
             agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")

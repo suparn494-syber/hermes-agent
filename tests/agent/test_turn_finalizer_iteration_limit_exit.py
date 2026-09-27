@@ -114,6 +114,30 @@ def _finalize(
     )
 
 
+def test_iteration_limit_status_reports_safe_stop_without_summary(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
+    agent._emit_status = MagicMock()
+    agent._safe_print = MagicMock()
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+    )
+
+    emitted = " ".join(
+        str(arg)
+        for reporter in (agent._emit_status, agent._safe_print)
+        for call in reporter.call_args_list
+        for arg in call.args
+    ).lower()
+    assert "summar" not in emitted
+    assert "stop" in emitted
+    assert agent._handle_max_iterations_called is True
+    assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
+
+
 
 
 

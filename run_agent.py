@@ -7692,14 +7692,24 @@ class AIAgent:
         """Record the first guardrail decision that should stop this turn."""
         if decision.should_halt and self._tool_guardrail_halt_decision is None:
             self._tool_guardrail_halt_decision = decision
+            self._circuit_broken = True
+            logger.warning(
+                "LOOP_GUARD_TRIGGERED session=%s code=%s tool=%s count=%s",
+                getattr(self, "session_id", ""),
+                decision.code,
+                decision.tool_name,
+                decision.count,
+            )
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
         tool = decision.tool_name or "a tool"
         return (
+            "LOOP_GUARD_TRIGGERED. "
             f"I stopped retrying {tool} because it hit the tool-call guardrail "
             f"({decision.code}) after {decision.count} repeated non-progressing "
-            "attempts. The last tool result explains the blocker; the next step is "
-            "to change strategy instead of repeating the same call."
+            "attempts. The last tool result explains the blocker. "
+            "The current user request is preserved; send a follow-up to continue "
+            "with a different strategy."
         )
 
     def _append_guardrail_observation(
@@ -7710,6 +7720,19 @@ class AIAgent:
         *,
         failed: bool,
     ) -> str:
+        from agent.tool_guardrails import cap_tool_result_for_history
+
+        cfg = getattr(self._tool_guardrails, "config", None)
+        max_chars = getattr(cfg, "max_tool_result_chars", 8000) if cfg is not None else 8000
+        store = None
+        home = getattr(self, "hermes_home", None) or getattr(self, "home", None)
+        if home:
+            store = str(Path(home) / "cache" / "tool-results")
+        function_result = cap_tool_result_for_history(
+            function_result or "",
+            max_chars=max_chars,
+            store_dir=store,
+        )
         decision = self._tool_guardrails.after_call(
             tool_name,
             function_args,
@@ -7904,6 +7927,8 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        *,
+        skill_write_policy=None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -7998,6 +8023,7 @@ class AIAgent:
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
+                    skill_write_policy=skill_write_policy,
                 )
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
